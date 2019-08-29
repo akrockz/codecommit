@@ -1,0 +1,7 @@
+[profile abc-dev1]
+role_arn = arn:aws:iam::3454:role/ADMIN
+color = 9608E2
+
+[profile abc-dev2]
+role_arn = arn:aws:iam::2345353:role/ADMIN
+color = 9608E2
