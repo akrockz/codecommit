@@ -1,0 +1,306 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Generic app template for a de-mlauto setup.'
+
+Parameters:
+
+  CodeCommitListenerLambdaArn:
+    Description: "arn of core-automation's CodeCommit listener lambda."
+    Type: String
+    Default: "arn:aws:lambda:ap-southeast-1:34543:function:core-automation-master-codecommit"
+
+  S3Bucket:
+    Description: "core automation s3 bucket name"
+    Type: String
+    Default: "sia-core-automation-ap-southeast-1"
+  RunShS3Key:
+    Description: "location of latest runDeMlauto.sh from deployed pipe."
+    Type: String
+    Default: "artefacts/core/automation-runner/master/_latest/runDeMlauto.sh"
+  RunZipS3Key:
+    Description: "location of latest run.zip from deployed pipe."
+    Type: String
+    Default: "artefacts/core/automation-runner/master/_latest/run.zip"
+  CodeBuildImage:
+    Description: "CodeBuild docker image"
+    Type: String
+    Default: "aws/codebuild/docker:17.09.0" #TODO - Build our own container
+  Portfolio:
+    Description: "core-automation Portfolio name"
+    Type: String
+  App:
+    Description: "core-automation App name"
+    Type: String
+  ModelConfig:
+    Description: "path of the model configuration file"
+    Type: String
+    Default: "models.yaml"
+  ECRRepo:
+    Description: "central ECR reporsitory for mlauto jobs"
+    Type: String
+    Default: "de-mlauto-master-ecr" #TODO
+  BaseImageRepo:
+    Description: "central ECR reporsitory for mlauto jobs"
+    Type: String
+    Default: "de-mlauto-master-base" #TODO
+  StateTriggerSNSTopic:
+    Description: "name of topic triggering the state machine"
+    Type: String
+    Default: "de-mlauto-core-master-launch" #TODO
+
+  TeardownStateFunction:
+    Description: 'name of the teardown state function'
+    Type: String
+    Default: "de-mlauto-core-master-teardown" #TODO
+
+  ProductionAccount:
+    Description: 'aws account id of the production environment'
+    Type: String
+    Default: "654782598114" #prod auto
+
+  NonProductionAccount:
+    Description: 'aws account id of the non production environment'
+    Type: String
+    Default: "378888410647" #nonprod auto
+
+  BuildHistoryTable:
+    Description: 'name of the dynamodb table to track the build versions'
+    Type: String
+    Default: "de-mlauto-master-build-history" #TODO
+
+  BuildHistoryRoleName:
+    Description: 'name of the role assumed by the codebuild job to track the release of KrisML'
+    Type: String
+    Default: "de-mlauto-master-1-release-table-role" #TODO
+
+Resources:
+
+  AppRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub "${Portfolio}-${App}"
+      RepositoryDescription: !Sub "${Portfolio}-${App} KrisML application"
+      Triggers:
+        - Name: codebuild-trigger
+          DestinationArn:
+            Ref: CodeCommitListenerLambdaArn
+          Events:
+            - createReference
+            - updateReference
+          # No branch restriction
+
+
+  AppBuild:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Sub "${Portfolio}-${App}"
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Description: Use demlauto.sh to trigger a build.
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: !Ref CodeBuildImage
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - { Name: RUNSH_S3_PATH, Type: PLAINTEXT, Value: !Join [ "/", [ "s3:/", !Ref S3Bucket, !Ref RunShS3Key ]] }
+          - { Name: ECR_REPO, Type: PLAINTEXT, Value: !Join [ ".", [ !Ref "AWS::AccountId", "dkr", "ecr", !Ref "AWS::Region", "amazonaws", "com" ]] }
+          - { Name: IMAGE_REPO_NAME, Value: !Ref ECRRepo }
+          - { Name: COREAUTOMATION_BUCKET, Value: !Ref S3Bucket} # To confirm?
+          - { Name: CONFIG_FILE , Value: !Ref ModelConfig} 
+          - { Name: TOPIC_ARN, Value: !Join [ ":", [ 'arn', 'aws', 'sns', !Ref "AWS::Region",  !Ref "AWS::AccountId", !Ref StateTriggerSNSTopic ]]  }
+          - { Name: BUILD_HISTORY_TABLE , Value: !Ref BuildHistoryTable } 
+      ServiceRole:
+        Ref: AppCodeBuildRole
+      Source:
+        Location: !GetAtt [AppRepo, CloneUrlHttp]
+        Type: CODECOMMIT
+        GitCloneDepth: 1 #TODO - Build our own container
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands: 
+                - apt-get update
+                - apt-get install jq -y
+                - apt-get install ruby -y
+                - aws s3 cp $RUNSH_S3_PATH ./runDeMlauto.sh
+                - chmod +x runDeMlauto.sh
+                - $(aws ecr get-login --no-include-email --region $AWS_DEFAULT_REGION)
+            build:
+              commands:
+                - ./runDeMlauto.sh build deploy -c $CLIENT -p $PORTFOLIO -a $APP -b $BRANCH -n $BUILD_NUMBER --buildtracking $BUILD_HISTORY_TABLE
+            post_build:
+              commands:
+                - cat compile-response.txt || true
+                - cat deploy-response.txt || true
+      Tags:
+        - { Key: Portfolio, Value: !Ref Portfolio }
+        - { Key: App, Value: !Ref App }
+
+  ## TODO: TEA
+  AppTeardown:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Sub "${Portfolio}-${App}-teardown"
+      Description: Use run.sh to teardown a build.
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - { Name: BRANCH, Type: PLAINTEXT, Value: '' }
+          - { Name: BUILD_NUMBER, Type: PLAINTEXT, Value: '' }
+        Image: !Ref CodeBuildImage
+        Type: LINUX_CONTAINER
+      ServiceRole:
+        Ref: AppCodeBuildRole
+      Source:
+        Type: S3
+        Location:
+          Fn::Join: [ "/", [ Ref: S3Bucket, Ref: RunZipS3Key ]]
+        GitCloneDepth: 1
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - apt-get update
+                - apt-get install jq -y
+                - apt-get install ruby -y
+                - chmod +x runDeMlauto.sh
+            build:
+              commands: 
+                - ./runDeMlauto.sh teardown -c sia -p ${Portfolio} -a ${App} -b $BRANCH -n $BUILD_NUMBER --nonprod-acccount ${NonProductionAccount} --prod-acccount ${ProductionAccount} --statefunction arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${TeardownStateFunction} --buildtracking ${BuildHistoryTable}
+                - cat teardown-response.txt || true
+      Tags:
+        - { Key: Portfolio, Value: !Ref Portfolio }
+        - { Key: App, Value: !Ref App }
+
+  ## TODO: TEA
+  AppRelease:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Name: !Sub "${Portfolio}-${App}-release"
+      Description: Use run.sh to release a build.
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - { Name: BRANCH, Type: PLAINTEXT, Value: '' }
+          - { Name: BUILD_NUMBER, Type: PLAINTEXT, Value: '' }
+        Image: !Ref CodeBuildImage
+        Type: LINUX_CONTAINER
+      ServiceRole:
+        Ref: AppCodeBuildRole
+      Source:
+        Type: S3
+        Location:
+          Fn::Join: [ "/", [ Ref: S3Bucket, Ref: RunZipS3Key ]]
+        BuildSpec: !Sub |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - chmod +x runDeMlauto.sh
+            build:
+              commands: 
+                - ./runDeMlauto.sh release -c sia -p ${Portfolio} -a ${App} -b $BRANCH -n $BUILD_NUMBER --nonprod-acccount ${NonProductionAccount} --prod-acccount ${ProductionAccount} --buildtracking ${BuildHistoryTable} --buildtrackingrole ${BuildHistoryRoleName}
+                - cat teardown-response.txt || true
+      Tags:
+        - { Key: Portfolio, Value: !Ref Portfolio }
+        - { Key: App, Value: !Ref App }
+
+  AppCodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: '/'
+      Policies:
+        - PolicyName: CodeBuildInlinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Join [ ":", [ 'arn', 'aws', 'sns', !Ref "AWS::Region",  !Ref "AWS::AccountId", !Ref StateTriggerSNSTopic ]]
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Join [ ":", [ 'arn', 'aws', 'states', !Ref "AWS::Region",  !Ref "AWS::AccountId", 'stateMachine', !Ref TeardownStateFunction ]]
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Join ['', ['arn:aws:logs:', !Ref 'AWS::Region', ':', !Ref 'AWS::AccountId', ':log-group:/aws/codebuild/', !Sub '${Portfolio}-*']]
+              - Effect: Allow
+                Action: codecommit:GitPull
+                Resource:
+                  - !GetAtt [AppRepo, Arn]
+              - Effect: Allow
+                Action:
+                  - 's3:List*'
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket' ]]
+              - Effect: Allow
+                Action:
+                  - s3:List*
+                  - s3:GetObject
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket', '/artefacts/core/automation-runner/*']]
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket', '/files/shared/*']]
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket', !Sub '/packages/${Portfolio}/*']]
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket', !Sub '/files/build/${Portfolio}/*']]
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket', !Sub '/files/app/${Portfolio}/*']]
+                  - !Join ['', ['arn:aws:s3:::', !Ref 'S3Bucket', !Sub '/files/branch/${Portfolio}/*']]
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeTable
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - Fn::Sub: "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${BuildHistoryTable}"
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Sub "arn:aws:iam::${NonProductionAccount}:role/${BuildHistoryRoleName}"
+                  - !Sub "arn:aws:iam::${ProductionAccount}:role/${BuildHistoryRoleName}"
+              #TODO need to restrict ecr permissions?
+              - Effect: Allow
+                Action:
+                  - 'ecr:*'
+                Resource:
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepo}"
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${BaseImageRepo}"
+              - Effect: Allow
+                Action:
+                  - "ecr:GetAuthorizationToken" 
+                Resource: 
+                  - '*'
+              - Effect: Allow
+                Action:
+                  - 'ssm:PutParameter'
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/de/mlauto/${Portfolio}/${App}/*"
+
+
