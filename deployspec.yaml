@@ -1,0 +1,24 @@
+
+- label: deploy-deployspec-demo-mlauto
+  type: create_stack
+  params:
+    template: generic-mlauto-deployspec.yaml
+    stack_name: "{{ core.Project }}-{{ core.App }}-momlauto"
+    parameters:
+      Portfolio: demo
+      App: demomlauto
+      CodeCommitListenerLambdaArn: arn:aws:lambda:ap-southeast-1:34543:function:core-automation-master-codecommit
+      # Not used by deml's run.sh
+      # InvokerLambdaArn: arn:aws:lambda:ap-southeast-1:123456789012:function:core-automation-*-invoker  # Allow any branch of the invoker!
+      RunShS3Key: artefacts/core/automation-runner/demlauto/_latest/runDeMlauto.sh
+      RunZipS3Key: artefacts/core/automation-runner/demlauto/_latest/run.zip
+      NonProductionAccount: "354354"  # nonprod auto
+      # Dev branch specific properties
+      ECRRepo: de-mlauto-dev-ecr
+      BaseImageRepo: de-mlauto-dev-base
+      StateTriggerSNSTopic: de-mlauto-core-dev-launch
+      TeardownStateFunction: de-mlauto-core-dev-teardown
+    accounts:
+      - "23543253"  # automation account
+    regions:
+      - ap-southeast-1  # Asia Pacific (Singapore)
